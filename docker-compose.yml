@@ -1,0 +1,13 @@
+services:
+  claude-code-exporter:
+    build: .
+    container_name: claude-code-exporter
+    restart: unless-stopped
+    environment:
+      - CLAUDE_DATA_DIR=/data
+      - INSTANCE_ID=${INSTANCE_ID:-mac}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://host.docker.internal:4317}
+      - POLL_INTERVAL=${POLL_INTERVAL:-30000}
+      - EXPORT_INTERVAL=${EXPORT_INTERVAL:-10000}
+    volumes:
+      - ${HOME}/.claude:/data:ro
