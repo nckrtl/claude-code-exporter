@@ -4,9 +4,11 @@ import { Resource } from "@opentelemetry/resources";
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "fs";
 import { join } from "path";
-import { hostname } from "os";
+import { hostname, homedir } from "os";
 
-const CLAUDE_DATA_DIR = process.env.CLAUDE_DATA_DIR || "/home/nckrtl/.claude";
+// Auto-detect Claude data directory (works on Mac and Linux)
+const DEFAULT_CLAUDE_DIR = join(homedir(), ".claude");
+const CLAUDE_DATA_DIR = process.env.CLAUDE_DATA_DIR || DEFAULT_CLAUDE_DIR;
 const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "http://otel-collector:4317";
 const EXPORT_INTERVAL = parseInt(process.env.EXPORT_INTERVAL || "10000", 10);
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || "30000", 10);
@@ -60,6 +62,10 @@ let previousActiveTimeSeconds = 0; // For calculating counter deltas
 // Persistence file for active time (survives restarts)
 const ACTIVE_TIME_FILE = join(CLAUDE_DATA_DIR, ".exporter-active-time.json");
 
+// Persistence file for seen conversations (for time-range aware counting)
+const SEEN_CONVERSATIONS_FILE = join(CLAUDE_DATA_DIR, ".exporter-seen-conversations.json");
+let seenConversationIds = new Set();
+
 function loadActiveTimeState() {
   try {
     if (existsSync(ACTIVE_TIME_FILE)) {
@@ -84,6 +90,30 @@ function saveActiveTimeState() {
     }), "utf8");
   } catch (e) {
     console.error(`Failed to save active time state: ${e.message}`);
+  }
+}
+
+function loadSeenConversations() {
+  try {
+    if (existsSync(SEEN_CONVERSATIONS_FILE)) {
+      const content = readFileSync(SEEN_CONVERSATIONS_FILE, "utf8");
+      const state = JSON.parse(content);
+      seenConversationIds = new Set(state.ids || []);
+      console.log(`Loaded ${seenConversationIds.size} seen conversation IDs`);
+    }
+  } catch (e) {
+    console.log(`Could not load seen conversations: ${e.message}`);
+  }
+}
+
+function saveSeenConversations() {
+  try {
+    writeFileSync(SEEN_CONVERSATIONS_FILE, JSON.stringify({ 
+      ids: Array.from(seenConversationIds),
+      lastUpdated: new Date().toISOString()
+    }), "utf8");
+  } catch (e) {
+    console.error(`Failed to save seen conversations: ${e.message}`);
   }
 }
 
@@ -148,6 +178,11 @@ const activeTimeCounter = meter.createCounter("claude.code.stats.active.time", {
   unit: "s",
 });
 
+const conversationCounter = meter.createCounter("claude.code.stats.conversation.count", {
+  description: "Total count of Claude Code conversations (from project directories)",
+  unit: "1",
+});
+
 // Track previous values to calculate deltas
 let previousMetrics = {
   sessionCount: 0,
@@ -155,11 +190,15 @@ let previousMetrics = {
   toolCallCount: 0,
   tokensByModel: {},  // model -> {input, output, cacheRead, cacheWrite}
   costByModel: {},    // model -> USD
+  conversationCount: 0,
   initialized: false,
 };
 
 // Track active sessions for info gauge
 let activeSessions = []; // Array of {sessionId, title, project, modified}
+
+// Track total conversations (all .jsonl files in projects dir)
+let totalConversations = 0;
 
 // Register callbacks for gauges only (counters are updated directly in updateMetrics)
 meter.addBatchObservableCallback(
@@ -200,6 +239,45 @@ function readStatsCache() {
 }
 
 const ACTIVE_SESSION_HOURS = parseInt(process.env.ACTIVE_SESSION_HOURS || "1", 10);
+
+function scanConversations() {
+  // Scan all .jsonl files in ~/.claude/projects/
+  // Returns { total, newIds } where newIds are conversations we haven't seen before
+  const projectsDir = join(CLAUDE_DATA_DIR, "projects");
+  if (!existsSync(projectsDir)) return { total: 0, newIds: [] };
+  
+  const allIds = [];
+  const newIds = [];
+  
+  try {
+    const projects = readdirSync(projectsDir);
+    for (const project of projects) {
+      const projectPath = join(projectsDir, project);
+      
+      try {
+        if (!statSync(projectPath).isDirectory()) continue;
+        
+        const files = readdirSync(projectPath);
+        for (const file of files) {
+          if (file.endsWith(".jsonl")) {
+            const conversationId = `${project}/${file}`;
+            allIds.push(conversationId);
+            
+            if (!seenConversationIds.has(conversationId)) {
+              newIds.push(conversationId);
+            }
+          }
+        }
+      } catch (e) {
+        // Skip directories we can't read
+      }
+    }
+  } catch (error) {
+    console.error(`Error scanning conversations: ${error.message}`);
+  }
+  
+  return { total: allIds.length, newIds };
+}
 
 function getActiveSessions() {
   // Read sessions from project directories
@@ -302,6 +380,9 @@ function updateMetrics() {
     }
   }
   
+  // Scan conversations - find new ones we haven't seen before
+  const { total: totalConversationCount, newIds: newConversationIds } = scanConversations();
+  
   // Build new token/cost maps
   const newTokensByModel = {};
   const newCostByModel = {};
@@ -365,6 +446,18 @@ function updateMetrics() {
       previousActiveTimeSeconds = cumulativeActiveTimeSeconds;
       console.log(`Backfilled active time: ${cumulativeActiveTimeSeconds}s`);
     }
+    
+    // For conversations: DON'T backfill - just mark existing ones as seen
+    // This ensures only NEW conversations (created after exporter starts) are counted
+    // which makes Grafana time range filtering work correctly
+    if (newConversationIds.length > 0) {
+      for (const id of newConversationIds) {
+        seenConversationIds.add(id);
+      }
+      saveSeenConversations();
+      console.log(`Marked ${newConversationIds.length} existing conversations as seen (not backfilled)`);
+    }
+    console.log(`Total conversations on disk: ${totalConversationCount}`);
     
     // Store as previous
     previousMetrics = {
@@ -440,6 +533,18 @@ function updateMetrics() {
       }
     }
     
+    // New conversations (ones we haven't seen before)
+    if (newConversationIds.length > 0) {
+      conversationCounter.add(newConversationIds.length, { source: INSTANCE_ID });
+      console.log(`New conversations: +${newConversationIds.length}`);
+      
+      // Mark them as seen
+      for (const id of newConversationIds) {
+        seenConversationIds.add(id);
+      }
+      saveSeenConversations();
+    }
+    
     // Update previous metrics
     previousMetrics = {
       sessionCount: newSessionCount,
@@ -483,7 +588,7 @@ function updateMetrics() {
   );
   
   const activeTimeHrs = (cumulativeActiveTimeSeconds / 3600).toFixed(1);
-  console.log(`Updated metrics: ${currentMetrics.sessionCount} sessions, ${currentMetrics.messageCount} messages, ${totalTokens.toLocaleString()} tokens, ${currentMetrics.toolCallCount} tool calls, ${currentMetrics.activeSessionCount} active, ${activeTimeHrs}h total active`);
+  console.log(`Updated: ${totalConversationCount} convos (${seenConversationIds.size} tracked), ${currentMetrics.sessionCount} sessions, ${currentMetrics.messageCount} msgs, ${totalTokens.toLocaleString()} tokens, ${currentMetrics.activeSessionCount} active`);
 }
 
 // Graceful shutdown
@@ -502,6 +607,7 @@ process.on("SIGTERM", async () => {
 // Start
 console.log("Starting metrics collection...");
 loadActiveTimeState();
+loadSeenConversations();
 updateMetrics();
 
 // Poll for updates
