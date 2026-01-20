@@ -2,7 +2,7 @@ import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-grpc";
 import { Resource } from "@opentelemetry/resources";
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
-import { readFileSync, existsSync, readdirSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "fs";
 import { join } from "path";
 import { hostname } from "os";
 
@@ -18,8 +18,9 @@ console.log(`OTLP Endpoint: ${OTEL_ENDPOINT}`);
 console.log(`Instance ID: ${INSTANCE_ID}`);
 
 // Set up OpenTelemetry
+// Use distinct service name to avoid conflicts with Claude Code's native telemetry
 const resource = new Resource({
-  [ATTR_SERVICE_NAME]: "claude-code",
+  [ATTR_SERVICE_NAME]: "claude-code-stats",
   [ATTR_SERVICE_VERSION]: "1.0.0",
   "service.instance.id": INSTANCE_ID,
 });
@@ -50,32 +51,88 @@ let currentMetrics = {
   activeSessionCount: 0,
 };
 
-// Observable gauges for cumulative totals (these report current values, not deltas)
-const sessionCountGauge = meter.createObservableGauge("claude.code.session.count", {
+// Active time tracking - cumulative counter (monotonically increasing)
+let lastPollTime = null;
+let wasActiveLastPoll = false;
+let cumulativeActiveTimeSeconds = 0; // Total ever, persisted
+let previousActiveTimeSeconds = 0; // For calculating counter deltas
+
+// Persistence file for active time (survives restarts)
+const ACTIVE_TIME_FILE = join(CLAUDE_DATA_DIR, ".exporter-active-time.json");
+
+function loadActiveTimeState() {
+  try {
+    if (existsSync(ACTIVE_TIME_FILE)) {
+      const content = readFileSync(ACTIVE_TIME_FILE, "utf8");
+      const state = JSON.parse(content);
+      cumulativeActiveTimeSeconds = state.cumulativeSeconds || 0;
+      lastPollTime = state.lastPollTime || null;
+      console.log(`Loaded cumulative active time: ${cumulativeActiveTimeSeconds}s`);
+    }
+  } catch (e) {
+    console.log(`Could not load active time state: ${e.message}`);
+  }
+  // Initialize the counter's previous value to match loaded state
+  // This will be set properly after the meter is created
+}
+
+function saveActiveTimeState() {
+  try {
+    writeFileSync(ACTIVE_TIME_FILE, JSON.stringify({ 
+      cumulativeSeconds: cumulativeActiveTimeSeconds,
+      lastPollTime: lastPollTime
+    }), "utf8");
+  } catch (e) {
+    console.error(`Failed to save active time state: ${e.message}`);
+  }
+}
+
+function updateActiveTime(hasActiveSessions) {
+  const now = Date.now();
+  
+  // If active and we have a previous poll time, add the delta
+  if (hasActiveSessions && wasActiveLastPoll && lastPollTime !== null) {
+    const deltaSeconds = Math.round((now - lastPollTime) / 1000);
+    if (deltaSeconds > 0) {
+      cumulativeActiveTimeSeconds += deltaSeconds;
+      console.log(`Active time: +${deltaSeconds}s (total: ${cumulativeActiveTimeSeconds}s)`);
+    }
+  }
+  
+  wasActiveLastPoll = hasActiveSessions;
+  lastPollTime = now;
+  
+  // Save state periodically
+  saveActiveTimeState();
+}
+
+// Counters for cumulative metrics (properly track deltas for rate() calculations)
+const sessionCounter = meter.createCounter("claude.code.session.count", {
   description: "Total count of Claude Code sessions",
   unit: "1",
 });
 
-const messageCountGauge = meter.createObservableGauge("claude.code.message.count", {
+const messageCounter = meter.createCounter("claude.code.message.count", {
   description: "Total count of messages",
   unit: "1",
 });
 
-const toolCallCountGauge = meter.createObservableGauge("claude.code.tool.usage", {
+const toolCallCounter = meter.createCounter("claude.code.tool.usage", {
   description: "Total count of tool calls",
   unit: "1",
 });
 
-const tokenUsageGauge = meter.createObservableGauge("claude.code.token.usage", {
+const tokenCounter = meter.createCounter("claude.code.token.usage", {
   description: "Token usage by type and model",
   unit: "tokens",
 });
 
-const costUsageGauge = meter.createObservableGauge("claude.code.cost.usage", {
+const costCounter = meter.createCounter("claude.code.cost.usage", {
   description: "Cost in USD by model",
   unit: "USD",
 });
 
+// Gauges for point-in-time values (these don't need rate())
 const activeSessionsGauge = meter.createObservableGauge("claude.code.session.active", {
   description: "Number of active sessions",
   unit: "1",
@@ -86,70 +143,31 @@ const sessionInfoGauge = meter.createObservableGauge("claude.code.session.info",
   unit: "1",
 });
 
+const activeTimeCounter = meter.createCounter("claude.code.active.time", {
+  description: "Cumulative active time (monotonically increasing)",
+  unit: "s",
+});
+
+// Track previous values to calculate deltas
+let previousMetrics = {
+  sessionCount: 0,
+  messageCount: 0,
+  toolCallCount: 0,
+  tokensByModel: {},  // model -> {input, output, cacheRead, cacheWrite}
+  costByModel: {},    // model -> USD
+  initialized: false,
+};
+
 // Track active sessions for info gauge
 let activeSessions = []; // Array of {sessionId, title, project, modified}
 
-// Register callbacks
+// Register callbacks for gauges only (counters are updated directly in updateMetrics)
 meter.addBatchObservableCallback(
   (batchObservableResult) => {
-    // Report totals
-    batchObservableResult.observe(sessionCountGauge, currentMetrics.sessionCount, {
-      source: INSTANCE_ID,
-    });
-    
-    batchObservableResult.observe(messageCountGauge, currentMetrics.messageCount, {
-      source: INSTANCE_ID,
-    });
-    
-    batchObservableResult.observe(toolCallCountGauge, currentMetrics.toolCallCount, {
-      source: INSTANCE_ID,
-    });
-    
+    // Report active sessions count
     batchObservableResult.observe(activeSessionsGauge, currentMetrics.activeSessionCount, {
       source: INSTANCE_ID,
     });
-    
-    // Report tokens by model and type
-    for (const [model, tokens] of Object.entries(currentMetrics.tokensByModel)) {
-      if (tokens.input > 0) {
-        batchObservableResult.observe(tokenUsageGauge, tokens.input, {
-          type: "input",
-          model,
-          source: INSTANCE_ID,
-        });
-      }
-      if (tokens.output > 0) {
-        batchObservableResult.observe(tokenUsageGauge, tokens.output, {
-          type: "output",
-          model,
-          source: INSTANCE_ID,
-        });
-      }
-      if (tokens.cacheRead > 0) {
-        batchObservableResult.observe(tokenUsageGauge, tokens.cacheRead, {
-          type: "cacheRead",
-          model,
-          source: INSTANCE_ID,
-        });
-      }
-      if (tokens.cacheWrite > 0) {
-        batchObservableResult.observe(tokenUsageGauge, tokens.cacheWrite, {
-          type: "cacheCreation",
-          model,
-          source: INSTANCE_ID,
-        });
-      }
-    }
-    
-    // Report cost by model
-    for (const [model, cost] of Object.entries(currentMetrics.costByModel)) {
-      if (cost > 0) {
-        batchObservableResult.observe(costUsageGauge, cost, {
-          model,
-          source: INSTANCE_ID,
-        });
-      }
-    }
     
     // Report active session info
     for (const session of activeSessions) {
@@ -161,7 +179,7 @@ meter.addBatchObservableCallback(
       });
     }
   },
-  [sessionCountGauge, messageCountGauge, toolCallCountGauge, tokenUsageGauge, costUsageGauge, activeSessionsGauge, sessionInfoGauge]
+  [activeSessionsGauge, sessionInfoGauge]
 );
 
 function readStatsCache() {
@@ -184,8 +202,8 @@ function readStatsCache() {
 const ACTIVE_SESSION_HOURS = parseInt(process.env.ACTIVE_SESSION_HOURS || "1", 10);
 
 function getActiveSessions() {
-  // Read sessions-index.json from each project directory
-  // Count sessions modified within the active window as "active"
+  // Read sessions from project directories
+  // Check actual file modification times (not just index timestamps)
   const projectsDir = join(CLAUDE_DATA_DIR, "projects");
   if (!existsSync(projectsDir)) return [];
   
@@ -197,31 +215,61 @@ function getActiveSessions() {
     const projects = readdirSync(projectsDir);
     for (const project of projects) {
       const projectPath = join(projectsDir, project);
-      const indexPath = join(projectPath, "sessions-index.json");
       
-      if (!existsSync(indexPath)) continue;
-      
+      // Skip if not a directory
       try {
-        const content = readFileSync(indexPath, "utf8");
-        const index = JSON.parse(content);
-        
-        if (!index.entries || !Array.isArray(index.entries)) continue;
-        
-        for (const entry of index.entries) {
-          // Check if session was modified within the active window
-          const modifiedTime = new Date(entry.modified).getTime();
-          if (modifiedTime > cutoffTime) {
-            sessions.push({
-              sessionId: entry.sessionId,
-              title: entry.firstPrompt ? entry.firstPrompt.slice(0, 100) : "",
-              project: entry.projectPath || project,
-              modified: entry.modified,
-              messageCount: entry.messageCount || 0,
-            });
+        if (!statSync(projectPath).isDirectory()) continue;
+      } catch (e) {
+        continue;
+      }
+      
+      // Build session info from index if available
+      const indexPath = join(projectPath, "sessions-index.json");
+      let sessionIndex = {};
+      
+      if (existsSync(indexPath)) {
+        try {
+          const content = readFileSync(indexPath, "utf8");
+          const index = JSON.parse(content);
+          if (index.entries && Array.isArray(index.entries)) {
+            for (const entry of index.entries) {
+              sessionIndex[entry.sessionId] = entry;
+            }
+          }
+        } catch (e) {
+          // Index unreadable, continue without it
+        }
+      }
+      
+      // Scan for .jsonl files and check actual modification times
+      try {
+        const files = readdirSync(projectPath);
+        for (const file of files) {
+          if (!file.endsWith(".jsonl")) continue;
+          
+          const filePath = join(projectPath, file);
+          const sessionId = file.replace(".jsonl", "");
+          
+          try {
+            const fileStat = statSync(filePath);
+            const fileModifiedTime = fileStat.mtimeMs;
+            
+            if (fileModifiedTime > cutoffTime) {
+              const indexEntry = sessionIndex[sessionId] || {};
+              sessions.push({
+                sessionId: sessionId,
+                title: indexEntry.firstPrompt ? indexEntry.firstPrompt.slice(0, 100) : "",
+                project: indexEntry.projectPath || project.replace(/-/g, "/").replace(/^\//, ""),
+                modified: new Date(fileModifiedTime).toISOString(),
+                messageCount: indexEntry.messageCount || 0,
+              });
+            }
+          } catch (e) {
+            // Skip files we can't stat
           }
         }
       } catch (e) {
-        // Skip projects with invalid index files
+        // Skip directories we can't read
       }
     }
   } catch (error) {
@@ -242,26 +290,25 @@ function updateMetrics() {
     return;
   }
   
-  // Update basic counts
-  currentMetrics.sessionCount = stats.totalSessions || 0;
-  currentMetrics.messageCount = stats.totalMessages || 0;
+  // Read current values from stats
+  const newSessionCount = stats.totalSessions || 0;
+  const newMessageCount = stats.totalMessages || 0;
   
   // Calculate total tool calls from daily activity
-  let totalToolCalls = 0;
+  let newToolCallCount = 0;
   if (stats.dailyActivity) {
     for (const day of stats.dailyActivity) {
-      totalToolCalls += day.toolCallCount || 0;
+      newToolCallCount += day.toolCallCount || 0;
     }
   }
-  currentMetrics.toolCallCount = totalToolCalls;
   
-  // Update token usage by model
-  currentMetrics.tokensByModel = {};
-  currentMetrics.costByModel = {};
+  // Build new token/cost maps
+  const newTokensByModel = {};
+  const newCostByModel = {};
   
   if (stats.modelUsage) {
     for (const [model, usage] of Object.entries(stats.modelUsage)) {
-      currentMetrics.tokensByModel[model] = {
+      newTokensByModel[model] = {
         input: usage.inputTokens || 0,
         output: usage.outputTokens || 0,
         cacheRead: usage.cacheReadInputTokens || 0,
@@ -269,21 +316,174 @@ function updateMetrics() {
       };
       
       if (usage.costUSD > 0) {
-        currentMetrics.costByModel[model] = usage.costUSD;
+        newCostByModel[model] = usage.costUSD;
       }
     }
   }
   
+  // On first run, initialize counters with current totals (backfill)
+  if (!previousMetrics.initialized) {
+    console.log("Initializing counters with current totals (backfill)...");
+    
+    // Add initial totals to counters
+    if (newSessionCount > 0) {
+      sessionCounter.add(newSessionCount, { source: INSTANCE_ID });
+    }
+    if (newMessageCount > 0) {
+      messageCounter.add(newMessageCount, { source: INSTANCE_ID });
+    }
+    if (newToolCallCount > 0) {
+      toolCallCounter.add(newToolCallCount, { source: INSTANCE_ID });
+    }
+    
+    // Add initial tokens
+    for (const [model, tokens] of Object.entries(newTokensByModel)) {
+      if (tokens.input > 0) {
+        tokenCounter.add(tokens.input, { type: "input", model, source: INSTANCE_ID });
+      }
+      if (tokens.output > 0) {
+        tokenCounter.add(tokens.output, { type: "output", model, source: INSTANCE_ID });
+      }
+      if (tokens.cacheRead > 0) {
+        tokenCounter.add(tokens.cacheRead, { type: "cacheRead", model, source: INSTANCE_ID });
+      }
+      if (tokens.cacheWrite > 0) {
+        tokenCounter.add(tokens.cacheWrite, { type: "cacheCreation", model, source: INSTANCE_ID });
+      }
+    }
+    
+    // Add initial costs
+    for (const [model, cost] of Object.entries(newCostByModel)) {
+      if (cost > 0) {
+        costCounter.add(cost, { model, source: INSTANCE_ID });
+      }
+    }
+    
+    // Backfill active time counter with historical cumulative value
+    if (cumulativeActiveTimeSeconds > 0) {
+      activeTimeCounter.add(cumulativeActiveTimeSeconds, { source: INSTANCE_ID });
+      previousActiveTimeSeconds = cumulativeActiveTimeSeconds;
+      console.log(`Backfilled active time: ${cumulativeActiveTimeSeconds}s`);
+    }
+    
+    // Store as previous
+    previousMetrics = {
+      sessionCount: newSessionCount,
+      messageCount: newMessageCount,
+      toolCallCount: newToolCallCount,
+      tokensByModel: JSON.parse(JSON.stringify(newTokensByModel)),
+      costByModel: JSON.parse(JSON.stringify(newCostByModel)),
+      initialized: true,
+    };
+    
+    const totalTokens = Object.values(newTokensByModel).reduce(
+      (sum, t) => sum + t.input + t.output + t.cacheRead + t.cacheWrite, 0
+    );
+    console.log(`Backfilled: ${newSessionCount} sessions, ${newMessageCount} messages, ${totalTokens.toLocaleString()} tokens`);
+  } else {
+    // Calculate and add deltas
+    let deltaTokens = 0;
+    
+    // Session delta
+    const sessionDelta = newSessionCount - previousMetrics.sessionCount;
+    if (sessionDelta > 0) {
+      sessionCounter.add(sessionDelta, { source: INSTANCE_ID });
+    }
+    
+    // Message delta
+    const messageDelta = newMessageCount - previousMetrics.messageCount;
+    if (messageDelta > 0) {
+      messageCounter.add(messageDelta, { source: INSTANCE_ID });
+    }
+    
+    // Tool call delta
+    const toolCallDelta = newToolCallCount - previousMetrics.toolCallCount;
+    if (toolCallDelta > 0) {
+      toolCallCounter.add(toolCallDelta, { source: INSTANCE_ID });
+    }
+    
+    // Token deltas by model
+    for (const [model, tokens] of Object.entries(newTokensByModel)) {
+      const prev = previousMetrics.tokensByModel[model] || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      
+      const inputDelta = tokens.input - prev.input;
+      if (inputDelta > 0) {
+        tokenCounter.add(inputDelta, { type: "input", model, source: INSTANCE_ID });
+        deltaTokens += inputDelta;
+      }
+      
+      const outputDelta = tokens.output - prev.output;
+      if (outputDelta > 0) {
+        tokenCounter.add(outputDelta, { type: "output", model, source: INSTANCE_ID });
+        deltaTokens += outputDelta;
+      }
+      
+      const cacheReadDelta = tokens.cacheRead - prev.cacheRead;
+      if (cacheReadDelta > 0) {
+        tokenCounter.add(cacheReadDelta, { type: "cacheRead", model, source: INSTANCE_ID });
+        deltaTokens += cacheReadDelta;
+      }
+      
+      const cacheWriteDelta = tokens.cacheWrite - prev.cacheWrite;
+      if (cacheWriteDelta > 0) {
+        tokenCounter.add(cacheWriteDelta, { type: "cacheCreation", model, source: INSTANCE_ID });
+        deltaTokens += cacheWriteDelta;
+      }
+    }
+    
+    // Cost deltas by model
+    for (const [model, cost] of Object.entries(newCostByModel)) {
+      const prevCost = previousMetrics.costByModel[model] || 0;
+      const costDelta = cost - prevCost;
+      if (costDelta > 0) {
+        costCounter.add(costDelta, { model, source: INSTANCE_ID });
+      }
+    }
+    
+    // Update previous metrics
+    previousMetrics = {
+      sessionCount: newSessionCount,
+      messageCount: newMessageCount,
+      toolCallCount: newToolCallCount,
+      tokensByModel: JSON.parse(JSON.stringify(newTokensByModel)),
+      costByModel: JSON.parse(JSON.stringify(newCostByModel)),
+      initialized: true,
+    };
+    
+    if (deltaTokens > 0) {
+      console.log(`Delta: +${deltaTokens.toLocaleString()} tokens`);
+    }
+  }
+  
+  // Update current metrics for gauges
+  currentMetrics.sessionCount = newSessionCount;
+  currentMetrics.messageCount = newMessageCount;
+  currentMetrics.toolCallCount = newToolCallCount;
+  currentMetrics.tokensByModel = newTokensByModel;
+  currentMetrics.costByModel = newCostByModel;
+  
   // Get active sessions (modified within last N hours)
   activeSessions = getActiveSessions();
   currentMetrics.activeSessionCount = activeSessions.length;
+  
+  // Update cumulative active time tracking
+  const prevActiveTime = cumulativeActiveTimeSeconds;
+  updateActiveTime(activeSessions.length > 0);
+  
+  // Add delta to counter (counter needs deltas, not absolute values)
+  const activeTimeDelta = cumulativeActiveTimeSeconds - previousActiveTimeSeconds;
+  if (activeTimeDelta > 0) {
+    activeTimeCounter.add(activeTimeDelta, { source: INSTANCE_ID });
+    previousActiveTimeSeconds = cumulativeActiveTimeSeconds;
+  }
   
   // Log summary
   const totalTokens = Object.values(currentMetrics.tokensByModel).reduce(
     (sum, t) => sum + t.input + t.output + t.cacheRead + t.cacheWrite, 0
   );
   
-  console.log(`Updated metrics: ${currentMetrics.sessionCount} sessions, ${currentMetrics.messageCount} messages, ${totalTokens.toLocaleString()} tokens, ${currentMetrics.toolCallCount} tool calls, ${currentMetrics.activeSessionCount} active`);
+  const activeTimeHrs = (cumulativeActiveTimeSeconds / 3600).toFixed(1);
+  console.log(`Updated metrics: ${currentMetrics.sessionCount} sessions, ${currentMetrics.messageCount} messages, ${totalTokens.toLocaleString()} tokens, ${currentMetrics.toolCallCount} tool calls, ${currentMetrics.activeSessionCount} active, ${activeTimeHrs}h total active`);
 }
 
 // Graceful shutdown
@@ -301,6 +501,7 @@ process.on("SIGTERM", async () => {
 
 // Start
 console.log("Starting metrics collection...");
+loadActiveTimeState();
 updateMetrics();
 
 // Poll for updates
