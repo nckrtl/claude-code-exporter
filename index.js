@@ -9,6 +9,8 @@ import { hostname, homedir } from "os";
 // Auto-detect Claude data directory (works on Mac and Linux)
 const DEFAULT_CLAUDE_DIR = join(homedir(), ".claude");
 const CLAUDE_DATA_DIR = process.env.CLAUDE_DATA_DIR || DEFAULT_CLAUDE_DIR;
+// State files can go to a separate writable dir (useful when CLAUDE_DATA_DIR is read-only)
+const STATE_DIR = process.env.EXPORTER_STATE_DIR || CLAUDE_DATA_DIR;
 const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "http://otel-collector:4317";
 const EXPORT_INTERVAL = parseInt(process.env.EXPORT_INTERVAL || "10000", 10);
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || "30000", 10);
@@ -16,6 +18,7 @@ const INSTANCE_ID = process.env.INSTANCE_ID || hostname();
 
 console.log(`Claude Code Metrics Exporter starting...`);
 console.log(`Claude data dir: ${CLAUDE_DATA_DIR}`);
+console.log(`State dir: ${STATE_DIR}`);
 console.log(`OTLP Endpoint: ${OTEL_ENDPOINT}`);
 console.log(`Instance ID: ${INSTANCE_ID}`);
 
@@ -60,10 +63,10 @@ let cumulativeActiveTimeSeconds = 0; // Total ever, persisted
 let previousActiveTimeSeconds = 0; // For calculating counter deltas
 
 // Persistence file for active time (survives restarts)
-const ACTIVE_TIME_FILE = join(CLAUDE_DATA_DIR, ".exporter-active-time.json");
+const ACTIVE_TIME_FILE = join(STATE_DIR, ".exporter-active-time.json");
 
 // Persistence file for seen conversations (for time-range aware counting)
-const SEEN_CONVERSATIONS_FILE = join(CLAUDE_DATA_DIR, ".exporter-seen-conversations.json");
+const SEEN_CONVERSATIONS_FILE = join(STATE_DIR, ".exporter-seen-conversations.json");
 let seenConversationIds = new Set();
 
 function loadActiveTimeState() {
