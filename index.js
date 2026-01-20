@@ -106,45 +106,45 @@ function updateActiveTime(hasActiveSessions) {
   saveActiveTimeState();
 }
 
-// Counters for cumulative metrics (properly track deltas for rate() calculations)
-const sessionCounter = meter.createCounter("claude.code.session.count", {
-  description: "Total count of Claude Code sessions",
+// Counters for cumulative metrics - use "stats" prefix to avoid conflicts with native telemetry
+const sessionCounter = meter.createCounter("claude.code.stats.session.count", {
+  description: "Total count of Claude Code sessions (from stats cache)",
   unit: "1",
 });
 
-const messageCounter = meter.createCounter("claude.code.message.count", {
-  description: "Total count of messages",
+const messageCounter = meter.createCounter("claude.code.stats.message.count", {
+  description: "Total count of messages (from stats cache)",
   unit: "1",
 });
 
-const toolCallCounter = meter.createCounter("claude.code.tool.usage", {
-  description: "Total count of tool calls",
+const toolCallCounter = meter.createCounter("claude.code.stats.tool.usage", {
+  description: "Total count of tool calls (from stats cache)",
   unit: "1",
 });
 
-const tokenCounter = meter.createCounter("claude.code.token.usage", {
-  description: "Token usage by type and model",
+const tokenCounter = meter.createCounter("claude.code.stats.token.usage", {
+  description: "Token usage by type and model (from stats cache)",
   unit: "tokens",
 });
 
-const costCounter = meter.createCounter("claude.code.cost.usage", {
-  description: "Cost in USD by model",
+const costCounter = meter.createCounter("claude.code.stats.cost.usage", {
+  description: "Cost in USD by model (from stats cache)",
   unit: "USD",
 });
 
-// Gauges for point-in-time values (these don't need rate())
-const activeSessionsGauge = meter.createObservableGauge("claude.code.session.active", {
-  description: "Number of active sessions",
+// Gauges for point-in-time values - use "stats" prefix to avoid conflicts
+const activeSessionsGauge = meter.createObservableGauge("claude.code.stats.session.active", {
+  description: "Number of active sessions (from stats cache)",
   unit: "1",
 });
 
-const sessionInfoGauge = meter.createObservableGauge("claude.code.session.info", {
-  description: "Active session information with metadata",
+const sessionInfoGauge = meter.createObservableGauge("claude.code.stats.session.info", {
+  description: "Active session information with metadata (from stats cache)",
   unit: "1",
 });
 
-const activeTimeCounter = meter.createCounter("claude.code.active.time", {
-  description: "Cumulative active time (monotonically increasing)",
+const activeTimeCounter = meter.createCounter("claude.code.stats.active.time", {
+  description: "Cumulative active time (from stats cache)",
   unit: "s",
 });
 
